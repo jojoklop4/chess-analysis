@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!--
+    viewport-fit=cover lets the board reach screen edges on notched phones.
+    Safe-area insets in CSS compensate for the status bar / home bar.
+  -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0d1117">
+  <meta name="description" content="Stockfish chess analysis — local engine, no server.">
+
+  <!-- PWA / install hints -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Chess">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+
+  <title>Chess Analysis</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!--
+    MUST be the first script loaded.
+    In page context: registers itself as a Service Worker and reloads
+    so the page runs with COOP/COEP headers (crossOriginIsolated = true).
+    That enables SharedArrayBuffer → Stockfish multi-threading.
+    On subsequent loads the SW is already in control — no reload needed.
+  -->
+  <script src="coi-serviceworker.js"></script>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ── HEADER ────────────────────────────────────────────────────────── -->
+  <header id="header">
+    <h1>♟ Chess Analysis</h1>
+    <div class="engine-status">
+      <div class="status-dot loading" id="status-dot"></div>
+      <span id="status-label">Starting…</span>
+    </div>
+  </header>
+
+  <!-- ── ENGINE ERROR BANNER ───────────────────────────────────────────── -->
+  <div id="error-banner"></div>
+
+  <!-- ── COI WARNING ───────────────────────────────────────────────────── -->
+  <div id="coi-warn">
+    ⚠ Not cross-origin-isolated — Threads locked to 1.
+    Reload once to activate the service worker, or deploy to a host that sets
+    COOP/COEP headers directly.
+  </div>
+
+  <!-- ── EVAL BAR ──────────────────────────────────────────────────────── -->
+  <div id="eval-row">
+    <div id="eval-bar"><div id="eval-fill"></div></div>
+    <div id="eval-score">—</div>
+  </div>
+
+  <!-- ── BOARD ─────────────────────────────────────────────────────────── -->
+  <div id="board-wrapper">
+    <div id="board"></div>
+  </div>
+
+  <!-- ── ANALYSIS STATS + PV ───────────────────────────────────────────── -->
+  <div id="analysis-panel">
+    <div class="stats-strip">
+      <div class="stat">
+        <div class="stat-label">Depth</div>
+        <div class="stat-value" id="stat-depth">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Nodes</div>
+        <div class="stat-value" id="stat-nodes">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">NPS</div>
+        <div class="stat-value" id="stat-nps">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Sel.Depth</div>
+        <div class="stat-value" id="stat-seldepth">—</div>
+      </div>
+    </div>
+    <div id="pv-lines"></div>
+  </div>
+
+  <!-- ── ENGINE CONTROLS ───────────────────────────────────────────────── -->
+  <div id="controls">
+    <button class="btn-start" id="btn-start" disabled>▶ Start</button>
+    <button class="btn-stop"  id="btn-stop"  disabled>■ Stop</button>
+    <button class="btn-flip"  id="btn-flip">⇅</button>
+    <button class="btn-new"   id="btn-new">↺</button>
+  </div>
+
+  <!-- ── ENGINE SETTINGS ───────────────────────────────────────────────── -->
+  <div class="collapsible">
+    <div class="coll-header">
+      <span class="coll-title">Engine Settings</span>
+      <span class="coll-arrow">▼</span>
+    </div>
+    <div class="coll-body">
+      <div class="setting-row">
+        <label for="s-threads">Threads</label>
+        <input type="range" id="s-threads" min="1" max="16" step="1" value="1">
+        <span class="setting-val" id="v-threads">1</span>
+      </div>
+
+      <div class="setting-row">
+        <label for="s-hash">Hash</label>
+        <input type="range" id="s-hash" min="16" max="512" step="16" value="64">
+        <span class="setting-val" id="v-hash">64MB</span>
+      </div>
+
+      <div class="setting-row">
+        <label for="s-multipv">Lines (Multi-PV)</label>
+        <input type="range" id="s-multipv" min="1" max="5" step="1" value="1">
+        <span class="setting-val" id="v-multipv">1</span>
+      </div>
+
+      <div class="setting-row">
+        <label for="s-depth">Max Depth</label>
+        <input type="range" id="s-depth" min="0" max="40" step="1" value="0">
+        <span class="setting-val" id="v-depth">∞</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── FEN / PGN I/O ─────────────────────────────────────────────────── -->
+  <div class="collapsible">
+    <div class="coll-header">
+      <span class="coll-title">FEN / PGN</span>
+      <span class="coll-arrow">▼</span>
+    </div>
+    <div class="coll-body">
+
+      <div class="io-group">
+        <label>FEN</label>
+        <input type="text" id="fen-input" spellcheck="false"
+               placeholder="Paste FEN string…">
+        <div class="io-btns">
+          <button id="btn-fen-load">Load</button>
+          <button id="btn-fen-copy">Copy</button>
+        </div>
+      </div>
+
+      <div class="io-group">
+        <label>PGN</label>
+        <textarea id="pgn-input" rows="5" spellcheck="false"
+                  placeholder="Paste PGN here…"></textarea>
+        <div class="io-btns">
+          <button id="btn-pgn-load">Load PGN</button>
+          <button id="btn-pgn-export">Export PGN</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</div><!-- /#app -->
+
+<!-- Drag ghost (follows finger) -->
+<div id="drag-ghost"><img alt="" crossorigin="anonymous"></div>
+
+<!-- Promotion chooser overlay -->
+<div id="promo-overlay">
+  <div class="promo-panel">
+    <p>Choose promotion piece</p>
+    <div class="promo-pieces"></div>
+  </div>
+</div>
+
+<!-- Toast notification -->
+<div id="toast"></div>
+
+<script type="module" src="app.js"></script>
+
+</body>
+</html>
