@@ -1,32 +1,41 @@
 /*
- * engine.worker.js
+ * engine.worker.js — Stockfish 16 NNUE · single-thread only
  *
- * "Worker runtime error: undefined" means worker.onerror fired with
- * ErrorEvent.message === undefined.  This happens when an error propagates
- * to the main thread without being caught inside the worker — often from
- * unhandled promise rejections or errors in async code that escape try/catch.
+ * Root cause of previous "Script error." at stage=factory-locate:
+ * ───────────────────────────────────────────────────────────────
+ *  The multi-thread build (stockfish-nnue-16.js) spawns pthread workers
+ *  at importScripts time.  Those workers attempt to load the same CDN
+ *  script cross-origin.  In a cross-origin-isolated context (COOP+COEP),
+ *  the browser hides the real error and reports "Script error." — the
+ *  opaque mask browsers use for cross-origin script failures.
  *
- * Fix strategy
- * ────────────
- *  1. self.onerror  — intercepts every sync error; returns true to suppress
- *                     the opaque "undefined" that reaches the main thread.
- *  2. self.onunhandledrejection — intercepts every async rejection that
- *                     escaped a try/catch.
- *  3. doLoad() is always awaited inside a .catch() — no rejection can escape.
- *  4. formatErr()   — safely extracts text from Error, DOMException,
- *                     WebAssembly.CompileError / RuntimeError, string,
- *                     undefined, ErrorEvent, PromiseRejectionEvent.
- *  5. stage         — a string updated at every loading step; appended to
- *                     every error so the exact point of failure is visible.
- *  6. Pre-fetch the WASM and validate magic bytes ourselves; pass the buffer
- *     directly as wasmBinary so Emscripten never constructs a URL for it.
- *  7. Try the single-thread build first (simpler, no SharedArrayBuffer for
- *     WASM itself); then the multi-thread build when crossOriginIsolated.
- *     Both are Stockfish 16 NNUE — same evaluation strength.
+ *  The single-thread build was also failing at factory-locate because
+ *  importScripts with a cross-origin URL runs the script but any internal
+ *  error propagates back as "Script error." too.
+ *
+ * Fix: two changes, nothing else modified.
+ * ────────────────────────────────────────
+ *  1. Single-thread build ONLY.  No multi-thread, no fallbacks to other
+ *     Stockfish versions.  stockfish-nnue-16-single.js does not spawn
+ *     pthread workers and has no cross-origin thread URL problem.
+ *
+ *  2. Blob URL loading.  Instead of:
+ *       importScripts('https://cdn.jsdelivr.net/…/stockfish-nnue-16-single.js')
+ *     we do:
+ *       text  = await fetch(url).text()
+ *       blob  = new Blob([text], {type:'text/javascript'})
+ *       blobUrl = URL.createObjectURL(blob)
+ *       importScripts(blobUrl)      ← same-origin
+ *     Blob URLs are always same-origin.  Any error from the script now
+ *     surfaces with the real message instead of the opaque "Script error.".
+ *
+ * UCI note:
+ *   The single-thread build does not expose a Threads UCI option.
+ *   Hash, MultiPV, and infinite analysis all work normally.
  *
  * Confirmed filenames (stockfish@16.0.0/src/):
- *   stockfish-nnue-16-single.js / .wasm   — 1-thread, no SharedArrayBuffer
- *   stockfish-nnue-16.js / .wasm          — multi-thread, needs SharedArrayBuffer
+ *   stockfish-nnue-16-single.js    ← only file we import
+ *   stockfish-nnue-16-single.wasm  ← pre-fetched, passed as wasmBinary
  *
  * Protocol (main → worker):
  *   { type:'init' }             start loading
@@ -34,66 +43,55 @@
  *
  * Protocol (worker → main):
  *   { type:'status',  message } loading progress
- *   { type:'loaded',  version, multiThread } engine initialised, uci sent
+ *   { type:'loaded',  version } Stockfish ready, uci handshake started
  *   { type:'uciok'  }           engine confirmed UCI mode
- *   { type:'readyok'}           engine ready for analysis commands
+ *   { type:'readyok'}           engine ready for analysis
  *   { type:'output',  line }    raw UCI output line
- *   { type:'error',   message } fatal — real reason, real stage, real URL
+ *   { type:'error',   message } fatal — real error, real stage, real URL
  */
 'use strict';
 
-// ── CONFIRMED CDN URLS ────────────────────────────────────────────────────────
-const BASE = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/';
+const SF_JS   = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js';
+const SF_WASM = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.wasm';
+const SF_BASE = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/';
 
-const SINGLE = {
-  label:       'Stockfish 16 NNUE · single-thread',
-  js:          BASE + 'stockfish-nnue-16-single.js',
-  wasm:        BASE + 'stockfish-nnue-16-single.wasm',
-  multiThread: false,
-};
-
-const MULTI = {
-  label:       'Stockfish 16 NNUE · multi-thread',
-  js:          BASE + 'stockfish-nnue-16.js',
-  wasm:        BASE + 'stockfish-nnue-16.wasm',
-  multiThread: true,
-};
-
-// ── STATE ─────────────────────────────────────────────────────────────────────
 let engine = null;
-let stage  = 'idle';        // updated at every step — appended to errors
+let stage  = 'idle';
 
-// ── TOP-LEVEL WORKER ERROR TRAPS ──────────────────────────────────────────────
-// These run BEFORE any user code and catch errors that escape every try/catch.
-// Returning true from self.onerror suppresses the opaque ErrorEvent that
-// reaches the main thread as "Worker runtime error: undefined".
+// ── TOP-LEVEL ERROR TRAPS ─────────────────────────────────────────────────────
+// These catch anything that escapes every try/catch — including errors from
+// scripts loaded via importScripts and unhandled promise rejections.
+// returning true from self.onerror suppresses the opaque propagation that
+// produced "Worker runtime error: undefined" on the main thread.
 
 self.onerror = function (message, source, lineno, colno, error) {
-  var text = message || '(no message)';
-  if (source)  text += '\nat ' + source + ':' + lineno + ':' + colno;
+  var text = (message || '(no message)');
+  if (source)  text += '\nat ' + source + ':' + (lineno || '?') + ':' + (colno || '?');
   if (error)   text += '\n' + formatErr(error);
-  emit('error', { message: '[Worker onerror / stage=' + stage + ']\n' + text });
-  return true;   // ← suppress propagation to main thread's worker.onerror
+  emit('error', {
+    message: 'Worker error at stage=' + stage + '\n' + text,
+  });
+  return true;   // suppress opaque propagation to main thread
 };
 
 self.onunhandledrejection = function (evt) {
-  if (evt && evt.preventDefault) evt.preventDefault();
-  var reason = evt && evt.reason !== undefined ? evt.reason : evt;
+  if (evt && typeof evt.preventDefault === 'function') evt.preventDefault();
+  var reason = (evt && evt.reason !== undefined) ? evt.reason : evt;
   emit('error', {
-    message: '[Unhandled rejection / stage=' + stage + ']\n' + formatErr(reason),
+    message: 'Unhandled rejection at stage=' + stage + '\n' + formatErr(reason),
   });
 };
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
 function emit(type, extra) {
-  self.postMessage(Object.assign({ type: type }, extra));
+  self.postMessage(Object.assign({ type: type }, extra || {}));
 }
 
 function processLine(raw) {
   var line = (typeof raw === 'string'
     ? raw
-    : String(raw && raw.data !== undefined ? raw.data : raw)
+    : String(raw && raw.data !== undefined ? raw.data : (raw || ''))
   ).trim();
   if (!line) return;
   emit('output', { line: line });
@@ -102,266 +100,270 @@ function processLine(raw) {
 }
 
 /*
- * formatErr — safely convert any thrown value to a human-readable string.
+ * formatErr — convert any thrown value to a readable string.
  * Handles: Error, DOMException, WebAssembly.CompileError / RuntimeError,
- *          string, number, null, undefined, plain objects, ErrorEvent.
+ *          string, number, null, undefined, ErrorEvent-shaped objects.
  */
 function formatErr(err) {
-  if (err === null || err === undefined) {
-    return '(error value is ' + String(err) + ')';
-  }
+  if (err === null || err === undefined) return '(' + String(err) + ')';
   if (typeof err === 'string') return err;
   if (typeof err === 'number') return 'Error code: ' + err;
 
-  // Object — build a comprehensive string
   var parts = [];
-
-  var name = err.name || (err.constructor && err.constructor.name) || '';
+  var name  = err.name || (err.constructor && err.constructor.name) || '';
   if (name && name !== 'Error') parts.push('[' + name + ']');
 
   var msg = err.message;
-  if (msg === undefined && err.reason) msg = formatErr(err.reason);   // PromiseRejectionEvent
-  if (msg === undefined && err.error)  msg = formatErr(err.error);    // ErrorEvent
-  if (msg !== undefined && msg !== '') parts.push(msg);
-
-  // ErrorEvent / onunhandledrejection carry source location
+  if (!msg && err.reason !== undefined) msg = formatErr(err.reason);
+  if (!msg && err.error  !== undefined) msg = formatErr(err.error);
+  if (msg) parts.push(msg);
   if (err.filename) parts.push('at ' + err.filename + ':' + (err.lineno || '?'));
 
-  if (parts.length === 0) {
-    // No name or message populated yet — use the name regardless of value,
-    // then fall back to JSON / String.
+  if (!parts.length) {
     if (name) return '[' + name + ']';
     try { return JSON.stringify(err); } catch (_) { return String(err); }
   }
 
-  // Append a short stack excerpt if available
   if (err.stack && typeof err.stack === 'string') {
-    var lines = err.stack.split('\n').filter(function(l){ return l.trim(); });
-    // Skip lines that just repeat the message
-    var frames = lines.filter(function(l){ return l.trim().startsWith('at '); });
-    if (frames.length) parts.push('\n' + frames.slice(0, 3).join('\n'));
+    var frames = err.stack.split('\n')
+      .filter(function (l) { return l.trim().indexOf('at ') === 0; })
+      .slice(0, 3);
+    if (frames.length) parts.push('\n' + frames.join('\n'));
   }
 
   return parts.join(' ');
 }
 
 // ── INCOMING MESSAGES ─────────────────────────────────────────────────────────
+
 self.onmessage = function (e) {
   var type = e.data && e.data.type;
   var cmd  = e.data && e.data.cmd;
   if (type === 'cmd' && engine) { engine.postMessage(cmd); return; }
-  if (type === 'init') startLoad();
+  if (type === 'init') {
+    doLoad().catch(function (err) {
+      emit('error', {
+        message: 'Load aborted at stage=' + stage + '\n' + formatErr(err),
+      });
+    });
+  }
 };
 
-// ── LOAD ENTRY POINT ──────────────────────────────────────────────────────────
-// doLoad is always awaited inside .catch() — no rejection can escape to
-// self.onunhandledrejection and produce a second error message.
-function startLoad() {
-  stage = 'starting';
-  doLoad().catch(function (err) {
-    emit('error', {
-      message: '[Escaped load error / stage=' + stage + ']\n' + formatErr(err),
-    });
-  });
-}
+// ── LOAD ──────────────────────────────────────────────────────────────────────
 
 async function doLoad() {
-  // Try single-thread first — it has fewer runtime dependencies.
-  // Add multi-thread as a second candidate when crossOriginIsolated is true
-  // (SharedArrayBuffer available, so pthreads can run).
-  var coi   = self.crossOriginIsolated === true;
-  var queue = coi ? [SINGLE, MULTI] : [SINGLE];
-  var failures = [];
 
-  for (var i = 0; i < queue.length; i++) {
-    var src = queue[i];
-    try {
-      await loadSource(src);
-      // Success
-      emit('loaded', { version: src.label, multiThread: src.multiThread });
-      engine.postMessage('uci');
-      return;
-    } catch (err) {
-      var detail = formatErr(err);
-      failures.push('▸ ' + src.label + '\n  Stage: ' + stage + '\n  ' + detail.replace(/\n/g, '\n  '));
-      emit('status', { message: src.label + ' failed at stage [' + stage + ']:\n' + detail });
-    }
-  }
-
-  // All sources failed — report every URL and failure
-  emit('error', {
-    message:
-      'Stockfish 16 NNUE could not be loaded.\n\n' +
-      failures.join('\n\n') +
-      '\n\nURLs attempted:\n' +
-      queue.map(function(s){ return '  JS:   ' + s.js + '\n  WASM: ' + s.wasm; }).join('\n') +
-      '\n\nCommon causes:\n' +
-      '  • No internet connection (CDN unreachable on first load).\n' +
-      '  • Browser blocks WebAssembly.\n' +
-      '  • The page is opened as a local file:// URL — use the https:// URL.\n' +
-      '  • GitHub Pages not yet deployed (wait 2 minutes after commit).',
-  });
-}
-
-// ── SOURCE LOADER ─────────────────────────────────────────────────────────────
-async function loadSource(src) {
-  var printEnabled = true;
-
-  // ── Step 1: Fetch the WASM binary ─────────────────────────────────────────
-  stage = 'wasm-fetch · ' + src.wasm;
-  emit('status', { message: 'Fetching WASM…\n' + src.wasm });
+  // ── Step 1: Fetch WASM binary ─────────────────────────────────────────────
+  stage = 'wasm-fetch';
+  emit('status', { message: 'Fetching WASM…\n' + SF_WASM });
 
   var wasmBinary;
   try {
-    var resp = await fetch(src.wasm);
+    var wr = await fetch(SF_WASM);
 
-    if (!resp.ok) {
+    if (!wr.ok) {
       throw new Error(
-        'HTTP ' + resp.status + ' ' + resp.statusText + '\nURL: ' + src.wasm
+        'HTTP ' + wr.status + ' ' + wr.statusText + '\nURL: ' + SF_WASM
+      );
+    }
+    var wct = wr.headers.get('content-type') || '';
+    if (/text\/html/i.test(wct)) {
+      throw new Error(
+        'Server returned HTML instead of WASM binary.\n' +
+        'URL: ' + SF_WASM + '\nContent-Type: ' + wct
       );
     }
 
-    var ct = resp.headers.get('content-type') || '';
-    if (/text\/html/i.test(ct)) {
-      throw new Error(
-        'Server returned HTML instead of a WASM binary (likely a 404 page).\n' +
-        'URL: ' + src.wasm + '\nContent-Type: ' + ct
-      );
-    }
-
-    stage = 'wasm-read · ' + src.wasm;
-    wasmBinary = await resp.arrayBuffer();
+    stage = 'wasm-read';
+    wasmBinary = await wr.arrayBuffer();
 
   } catch (fetchErr) {
-    // Re-throw with stage context
-    throw new Error(
-      'WASM fetch failed.\nStage: ' + stage + '\n' + formatErr(fetchErr)
-    );
+    throw new Error('WASM fetch failed\n' + formatErr(fetchErr));
   }
 
-  // ── Step 2: Validate magic bytes ──────────────────────────────────────────
-  // Valid WASM starts with 0x00 0x61 0x73 0x6D (\0asm).
-  // 0x3C 0x21 0x44 0x4F = "<!DO" = an HTML page.
-  stage = 'wasm-validate · ' + src.wasm;
+  // ── Step 2: Validate WASM magic bytes ─────────────────────────────────────
+  // Valid WebAssembly files start with 0x00 0x61 0x73 0x6D (\0asm).
+  // 0x3C 0x21 0x44 0x4F = "<!DO" = an HTML error page.
+  stage = 'wasm-validate';
 
   var magic = new Uint8Array(wasmBinary, 0, 4);
   if (magic[0] !== 0x00 || magic[1] !== 0x61 ||
       magic[2] !== 0x73 || magic[3] !== 0x6d) {
-
     var hex = Array.from(magic)
-      .map(function(b){ return b.toString(16).padStart(2, '0'); }).join(' ');
-    var isHtml = magic[0] === 0x3c;   // '<'
+      .map(function (b) { return b.toString(16).padStart(2, '0'); })
+      .join(' ');
     throw new Error(
       'Invalid WASM binary — magic bytes wrong.\n' +
-      'URL:      ' + src.wasm + '\n' +
-      'Expected: 00 61 73 6d\n' +
+      'URL:      ' + SF_WASM + '\n' +
+      'Expected: 00 61 73 6d  (\\0asm)\n' +
       'Got:      ' + hex +
-      (isHtml ? '\n(leading 0x3c = "<" — server returned an HTML error page)' : '')
+      (magic[0] === 0x3c
+        ? '\n(0x3c = "<" — the CDN returned an HTML error page, not a WASM file)'
+        : '')
     );
   }
 
-  var sizeMB = (wasmBinary.byteLength / 1048576).toFixed(1);
-  emit('status', { message: 'WASM OK · ' + sizeMB + ' MB · loading JS…' });
+  var mb = (wasmBinary.byteLength / 1048576).toFixed(1);
+  emit('status', { message: 'WASM valid · ' + mb + ' MB\nFetching engine JS…' });
 
-  // ── Step 3: Set global Module BEFORE importScripts ────────────────────────
+  // ── Step 3: Fetch JS as text, load via blob URL ───────────────────────────
+  //
+  // WHY BLOB URL:
+  //   importScripts with a cross-origin CDN URL is subject to the browser's
+  //   cross-origin error masking.  Any error inside the script — SyntaxError,
+  //   RuntimeError, missing feature, etc. — arrives as the opaque "Script error."
+  //   with no details.
+  //
+  //   Blob URLs are always same-origin.  By fetching the JS text ourselves
+  //   (which only requires CORP from the CDN, which jsDelivr provides) and
+  //   wrapping it in a Blob, we get full error details if the script throws.
+  //
+  stage = 'js-fetch';
+
+  var jsText;
+  try {
+    var jr = await fetch(SF_JS);
+    if (!jr.ok) {
+      throw new Error(
+        'HTTP ' + jr.status + ' ' + jr.statusText + '\nURL: ' + SF_JS
+      );
+    }
+    var jct = jr.headers.get('content-type') || '';
+    if (/text\/html/i.test(jct)) {
+      throw new Error(
+        'Server returned HTML instead of JavaScript.\n' +
+        'URL: ' + SF_JS + '\nContent-Type: ' + jct
+      );
+    }
+    stage = 'js-read';
+    jsText = await jr.text();
+  } catch (fetchErr) {
+    throw new Error('JS fetch failed\n' + formatErr(fetchErr));
+  }
+
+  // Create the blob URL and clean it up whether importScripts succeeds or not.
+  stage = 'blob-create';
+  var blobUrl = URL.createObjectURL(
+    new Blob([jsText], { type: 'text/javascript' })
+  );
+
+  // ── Step 4: Set Module BEFORE importScripts ───────────────────────────────
   // Some Emscripten builds read the global Module at parse time.
-  // We pass wasmBinary here so if the build reads it at load time, it uses it.
+  // Providing wasmBinary here (and again to the factory in step 6) means
+  // the engine never needs to fetch the WASM by URL — it uses our buffer.
   stage = 'module-setup';
+  var printEnabled = true;
   self.Module = {
     wasmBinary:  wasmBinary,
-    print:       function(line) { if (printEnabled) processLine(line); },
-    printErr:    function() {},
-    locateFile:  function(name) { return BASE + name; },
+    locateFile:  function (name) { return SF_BASE + name; },
+    print:       function (line) { if (printEnabled) processLine(line); },
+    printErr:    function () {},
   };
 
-  // ── Step 4: importScripts — loads the factory JS ──────────────────────────
-  stage = 'js-import · ' + src.js;
-  importScripts(src.js);   // synchronous; throws on network error or HTTP 4xx
+  // ── Step 5: importScripts via blob URL ────────────────────────────────────
+  // Now same-origin → real error messages on failure.
+  stage = 'js-import';
+  try {
+    importScripts(blobUrl);
+  } catch (importErr) {
+    URL.revokeObjectURL(blobUrl);
+    throw new Error(
+      'importScripts failed for ' + SF_JS + '\n' + formatErr(importErr)
+    );
+  }
+  URL.revokeObjectURL(blobUrl);
 
-  // ── Step 5: Locate the factory function ───────────────────────────────────
-  // The build may set self.Stockfish, self.STOCKFISH, or overwrite self.Module.
-  // We saved preModule above; if self.Module is now a function, the script
-  // replaced it with the factory (classic Emscripten output pattern).
-  stage = 'factory-locate · ' + src.js;
+  // ── Step 6: Locate the factory ────────────────────────────────────────────
+  // The build may set self.Stockfish, self.STOCKFISH, or overwrite self.Module
+  // with a function (some Emscripten builds replace the Module object with
+  // the factory function itself).
+  stage = 'factory-locate';
 
+  var origModuleIsFunc = typeof self.Module === 'function';
   var factory =
     (typeof self.Stockfish  === 'function' ? self.Stockfish  : null) ||
     (typeof self.STOCKFISH  === 'function' ? self.STOCKFISH  : null) ||
+    (origModuleIsFunc                      ? self.Module     : null) ||
     null;
 
   if (!factory) {
-    // Log what keys were added to self after importScripts
+    // Report all keys that appeared on self after importScripts
     var selfKeys = Object.keys(self)
-      .filter(function(k){ return k !== 'Module'; })
-      .join(', ');
+      .filter(function (k) {
+        return !['Module','onerror','onunhandledrejection','onmessage'].includes(k);
+      });
     throw new Error(
-      'No Stockfish/STOCKFISH factory found after importScripts.\n' +
-      'URL: ' + src.js + '\n' +
-      'self keys: ' + (selfKeys || '(none)') + '\n' +
-      'The file may use ES module syntax (incompatible with importScripts), ' +
-      'or export the factory under a different name.'
+      'No Stockfish factory found on self after importScripts.\n' +
+      'URL: ' + SF_JS + '\n' +
+      'self keys after import: ' + (selfKeys.length ? selfKeys.join(', ') : '(none added)') + '\n' +
+      'typeof self.Stockfish: ' + typeof self.Stockfish + '\n' +
+      'typeof self.STOCKFISH: ' + typeof self.STOCKFISH + '\n' +
+      'typeof self.Module:    ' + typeof self.Module + '\n\n' +
+      'Possible cause: the .js file uses ES module syntax (export/import)\n' +
+      'and cannot be loaded by importScripts in a classic worker.\n' +
+      'If this is the case, the engine.worker.js must be converted to a\n' +
+      'module worker (new Worker(url, {type:"module"})) and use dynamic import().'
     );
   }
 
-  // ── Step 6: Call the factory with pre-fetched wasmBinary ─────────────────
-  // Emscripten skips its internal WASM URL fetch when wasmBinary is provided.
-  // This is what prevented the previous "3c 21 44 4f" crash.
-  stage = 'factory-call · ' + src.js;
-
+  // ── Step 7: Call factory ──────────────────────────────────────────────────
+  stage = 'factory-call';
   var factoryResult;
   try {
     factoryResult = factory({
       wasmBinary:  wasmBinary,
-      print:       function(line) { if (printEnabled) processLine(line); },
-      printErr:    function() {},
-      locateFile:  function(name) { return BASE + name; },
+      locateFile:  function (name) { return SF_BASE + name; },
+      print:       function (line) { if (printEnabled) processLine(line); },
+      printErr:    function () {},
     });
   } catch (callErr) {
-    throw new Error(
-      'Factory call threw synchronously.\n' + formatErr(callErr)
-    );
+    throw new Error('Factory call threw synchronously\n' + formatErr(callErr));
   }
 
-  // ── Step 7: Await WASM instantiation ──────────────────────────────────────
+  // ── Step 8: Await WASM instantiation ──────────────────────────────────────
   // SF16 NNUE: Stockfish() returns a Promise that resolves once the WASM
-  // module is compiled and the engine is ready.
-  stage = 'wasm-instantiate · ' + src.wasm;
-
+  // module is compiled and the engine has started.
+  stage = 'wasm-instantiate';
   var sf;
   try {
     sf = (factoryResult && typeof factoryResult.then === 'function')
       ? await factoryResult
       : factoryResult;
-  } catch (instantiateErr) {
-    throw new Error(
-      'WASM instantiation failed.\n' + formatErr(instantiateErr)
-    );
+  } catch (instErr) {
+    throw new Error('WASM instantiation failed\n' + formatErr(instErr));
   }
 
   if (!sf || typeof sf.postMessage !== 'function') {
     throw new Error(
       'Factory resolved but engine object has no postMessage method.\n' +
-      'URL: ' + src.js + '\n' +
-      'Received: ' + String(sf)
+      'URL: ' + SF_JS + '\n' +
+      'Received type: ' + typeof sf + '  value: ' + String(sf)
     );
   }
 
-  // ── Step 8: Wire the UCI output listener ──────────────────────────────────
-  // addMessageListener is the standard nmrugg SF16 API.
-  // If present, disable Module.print to prevent duplicate lines.
+  // ── Step 9: Wire UCI output listener ──────────────────────────────────────
+  // addMessageListener is the standard nmrugg SF16 UCI output API.
+  // If present, disable Module.print to avoid duplicate output lines.
   stage = 'wire-listener';
-
   if (typeof sf.addMessageListener === 'function') {
     printEnabled = false;
     sf.addMessageListener(processLine);
   } else if ('onmessage' in sf) {
     printEnabled = false;
-    sf.onmessage = function(e) {
+    sf.onmessage = function (e) {
       processLine(typeof e === 'string' ? e : (e && e.data !== undefined ? e.data : ''));
     };
   }
-  // If neither API exists, Module.print (wired above) handles output.
+  // If neither API is present, Module.print (wired in step 4) handles output.
 
-  stage = 'ready · ' + src.label;
+  stage = 'ready';
   engine = sf;
+
+  emit('loaded', {
+    version:     'Stockfish 16 NNUE · single-thread',
+    multiThread: false,
+  });
+
+  // Start UCI handshake — engine will respond with id lines then 'uciok'.
+  sf.postMessage('uci');
 }
