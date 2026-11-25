@@ -1,150 +1,115 @@
 /*
- * engine.worker.js — Stockfish 16 NNUE · single-thread only
+ * engine.worker.js
  *
- * Root cause of previous "Script error." at stage=factory-locate:
- * ───────────────────────────────────────────────────────────────
- *  The multi-thread build (stockfish-nnue-16.js) spawns pthread workers
- *  at importScripts time.  Those workers attempt to load the same CDN
- *  script cross-origin.  In a cross-origin-isolated context (COOP+COEP),
- *  the browser hides the real error and reports "Script error." — the
- *  opaque mask browsers use for cross-origin script failures.
+ * Architecture (corrected)
+ * ────────────────────────
+ * stockfish-nnue-16-single.js is a Web Worker script, not a library.
+ * The correct usage is:
  *
- *  The single-thread build was also failing at factory-locate because
- *  importScripts with a cross-origin URL runs the script but any internal
- *  error propagates back as "Script error." too.
+ *   const sf = new Worker('https://cdn.../stockfish-nnue-16-single.js')
+ *   sf.postMessage('uci')          // plain-string UCI commands in
+ *   sf.onmessage = e => e.data     // plain-string UCI lines out
  *
- * Fix: two changes, nothing else modified.
- * ────────────────────────────────────────
- *  1. Single-thread build ONLY.  No multi-thread, no fallbacks to other
- *     Stockfish versions.  stockfish-nnue-16-single.js does not spawn
- *     pthread workers and has no cross-origin thread URL problem.
+ * When run this way:
+ *   · The Stockfish worker loads its own WASM via a path relative to
+ *     its CDN URL.  The WASM is at the same CDN origin → same-origin
+ *     fetch, no CORS needed, no COEP conflict.
+ *   · No importScripts(), no factory function, no wasmBinary, no
+ *     locateFile override.  The worker manages all of that internally.
  *
- *  2. Blob URL loading.  Instead of:
- *       importScripts('https://cdn.jsdelivr.net/…/stockfish-nnue-16-single.js')
- *     we do:
- *       text  = await fetch(url).text()
- *       blob  = new Blob([text], {type:'text/javascript'})
- *       blobUrl = URL.createObjectURL(blob)
- *       importScripts(blobUrl)      ← same-origin
- *     Blob URLs are always same-origin.  Any error from the script now
- *     surfaces with the real message instead of the opaque "Script error.".
+ * Why importScripts() failed:
+ *   importScripts(CDN_URL) executes the script inside our wrapper
+ *   worker's realm.  The script spawns sub-workers for WASM thread
+ *   support using its own CDN URL.  Those sub-workers attempt to load
+ *   a cross-origin script inside our cross-origin-isolated realm.
+ *   The browser masks the real error as "Script error." — permanently.
+ *   A blob URL did not help: the sub-worker spawn still used the CDN
+ *   URL, so the same masking applied.
  *
- * UCI note:
- *   The single-thread build does not expose a Threads UCI option.
- *   Hash, MultiPV, and infinite analysis all work normally.
- *
- * Confirmed filenames (stockfish@16.0.0/src/):
- *   stockfish-nnue-16-single.js    ← only file we import
- *   stockfish-nnue-16-single.wasm  ← pre-fetched, passed as wasmBinary
- *
- * Protocol (main → worker):
+ * Protocol (main → this worker):
  *   { type:'init' }             start loading
- *   { type:'cmd', cmd:'...' }   forward UCI string to engine
+ *   { type:'cmd', cmd:'...' }   forward UCI string to Stockfish
  *
- * Protocol (worker → main):
+ * Protocol (this worker → main):
  *   { type:'status',  message } loading progress
- *   { type:'loaded',  version } Stockfish ready, uci handshake started
+ *   { type:'loaded',  version } Stockfish worker started, uci sent
  *   { type:'uciok'  }           engine confirmed UCI mode
  *   { type:'readyok'}           engine ready for analysis
  *   { type:'output',  line }    raw UCI output line
- *   { type:'error',   message } fatal — real error, real stage, real URL
+ *   { type:'error',   message } fatal — real reason and stage
  */
 'use strict';
 
 const SF_JS   = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js';
 const SF_WASM = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.wasm';
-const SF_BASE = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/';
 
-let engine = null;
-let stage  = 'idle';
+let sfWorker  = null;
+let stage     = 'idle';
+let initTimer = null;
 
-// ── TOP-LEVEL ERROR TRAPS ─────────────────────────────────────────────────────
-// These catch anything that escapes every try/catch — including errors from
-// scripts loaded via importScripts and unhandled promise rejections.
-// returning true from self.onerror suppresses the opaque propagation that
-// produced "Worker runtime error: undefined" on the main thread.
-
-self.onerror = function (message, source, lineno, colno, error) {
-  var text = (message || '(no message)');
-  if (source)  text += '\nat ' + source + ':' + (lineno || '?') + ':' + (colno || '?');
-  if (error)   text += '\n' + formatErr(error);
-  emit('error', {
-    message: 'Worker error at stage=' + stage + '\n' + text,
-  });
-  return true;   // suppress opaque propagation to main thread
-};
-
-self.onunhandledrejection = function (evt) {
-  if (evt && typeof evt.preventDefault === 'function') evt.preventDefault();
-  var reason = (evt && evt.reason !== undefined) ? evt.reason : evt;
-  emit('error', {
-    message: 'Unhandled rejection at stage=' + stage + '\n' + formatErr(reason),
-  });
-};
-
-// ── HELPERS ───────────────────────────────────────────────────────────────────
+// ── HELPERS (defined first so every callback below can close over them) ──────
 
 function emit(type, extra) {
   self.postMessage(Object.assign({ type: type }, extra || {}));
 }
 
-function processLine(raw) {
-  var line = (typeof raw === 'string'
-    ? raw
-    : String(raw && raw.data !== undefined ? raw.data : (raw || ''))
-  ).trim();
-  if (!line) return;
-  emit('output', { line: line });
-  if (line === 'uciok')    emit('uciok');
-  if (line === 'readyok') emit('readyok');
-}
-
-/*
- * formatErr — convert any thrown value to a readable string.
- * Handles: Error, DOMException, WebAssembly.CompileError / RuntimeError,
- *          string, number, null, undefined, ErrorEvent-shaped objects.
- */
-function formatErr(err) {
+function fmt(err) {
   if (err === null || err === undefined) return '(' + String(err) + ')';
   if (typeof err === 'string') return err;
   if (typeof err === 'number') return 'Error code: ' + err;
-
   var parts = [];
   var name  = err.name || (err.constructor && err.constructor.name) || '';
   if (name && name !== 'Error') parts.push('[' + name + ']');
-
   var msg = err.message;
-  if (!msg && err.reason !== undefined) msg = formatErr(err.reason);
-  if (!msg && err.error  !== undefined) msg = formatErr(err.error);
+  if (!msg && err.reason !== undefined) msg = fmt(err.reason);
+  if (!msg && err.error  !== undefined) msg = fmt(err.error);
   if (msg) parts.push(msg);
   if (err.filename) parts.push('at ' + err.filename + ':' + (err.lineno || '?'));
-
   if (!parts.length) {
     if (name) return '[' + name + ']';
     try { return JSON.stringify(err); } catch (_) { return String(err); }
   }
-
   if (err.stack && typeof err.stack === 'string') {
     var frames = err.stack.split('\n')
       .filter(function (l) { return l.trim().indexOf('at ') === 0; })
       .slice(0, 3);
     if (frames.length) parts.push('\n' + frames.join('\n'));
   }
-
   return parts.join(' ');
 }
 
-// ── INCOMING MESSAGES ─────────────────────────────────────────────────────────
+// ── TOP-LEVEL TRAPS (wrapper worker) ─────────────────────────────────────────
+// Catch anything that escapes try/catch in this wrapper worker.
+// Return true suppresses the opaque "Worker runtime error: undefined" that
+// previously reached the main thread.
+
+self.onerror = function (message, source, lineno, colno, error) {
+  var text = (message || '(no message)');
+  if (source) text += '\nat ' + source + ':' + (lineno || '?') + ':' + (colno || '?');
+  if (error)  text += '\n' + fmt(error);
+  emit('error', { message: 'Wrapper worker error at stage=' + stage + '\n' + text });
+  return true;
+};
+
+self.onunhandledrejection = function (evt) {
+  if (evt && typeof evt.preventDefault === 'function') evt.preventDefault();
+  var r = (evt && evt.reason !== undefined) ? evt.reason : evt;
+  emit('error', { message: 'Unhandled rejection at stage=' + stage + '\n' + fmt(r) });
+};
+
+// ── INCOMING (from main thread) ───────────────────────────────────────────────
 
 self.onmessage = function (e) {
   var type = e.data && e.data.type;
   var cmd  = e.data && e.data.cmd;
-  if (type === 'cmd' && engine) { engine.postMessage(cmd); return; }
+
+  if (type === 'cmd') {
+    if (sfWorker) sfWorker.postMessage(cmd);
+    return;
+  }
   if (type === 'init') {
     doLoad().catch(function (err) {
-      emit('error', {
-        message: 'Load aborted at stage=' + stage + '\n' + formatErr(err),
-      });
+      emit('error', { message: 'Init failed at stage=' + stage + '\n' + fmt(err) });
     });
   }
 };
@@ -153,217 +118,136 @@ self.onmessage = function (e) {
 
 async function doLoad() {
 
-  // ── Step 1: Fetch WASM binary ─────────────────────────────────────────────
-  stage = 'wasm-fetch';
-  emit('status', { message: 'Fetching WASM…\n' + SF_WASM });
+  // ── 1. Verify both CDN URLs return HTTP 200 ───────────────────────────────
+  // This surfaces wrong or missing URLs with a clear message before we try
+  // to create the Worker, rather than a 30-second timeout or masked error.
+  stage = 'url-check';
+  emit('status', { message: 'Checking CDN URLs…' });
 
-  var wasmBinary;
+  await verifyUrl(SF_JS,   'JS');
+  await verifyUrl(SF_WASM, 'WASM');
+
+  emit('status', { message: 'URLs OK · creating Stockfish worker…' });
+
+  // ── 2. Create the Stockfish worker ────────────────────────────────────────
+  // The CDN script runs in its own Worker realm.
+  // · Its WASM URL is resolved relative to its own CDN URL (same-origin
+  //   from the WASM's perspective — no CORS needed).
+  // · It is NOT cross-origin-isolated; that is fine for the single-thread
+  //   build, which does not require SharedArrayBuffer.
+  // · Message protocol: plain strings in both directions.
+  stage = 'sf-worker-create';
+
   try {
-    var wr = await fetch(SF_WASM);
-
-    if (!wr.ok) {
-      throw new Error(
-        'HTTP ' + wr.status + ' ' + wr.statusText + '\nURL: ' + SF_WASM
-      );
-    }
-    var wct = wr.headers.get('content-type') || '';
-    if (/text\/html/i.test(wct)) {
-      throw new Error(
-        'Server returned HTML instead of WASM binary.\n' +
-        'URL: ' + SF_WASM + '\nContent-Type: ' + wct
-      );
-    }
-
-    stage = 'wasm-read';
-    wasmBinary = await wr.arrayBuffer();
-
-  } catch (fetchErr) {
-    throw new Error('WASM fetch failed\n' + formatErr(fetchErr));
-  }
-
-  // ── Step 2: Validate WASM magic bytes ─────────────────────────────────────
-  // Valid WebAssembly files start with 0x00 0x61 0x73 0x6D (\0asm).
-  // 0x3C 0x21 0x44 0x4F = "<!DO" = an HTML error page.
-  stage = 'wasm-validate';
-
-  var magic = new Uint8Array(wasmBinary, 0, 4);
-  if (magic[0] !== 0x00 || magic[1] !== 0x61 ||
-      magic[2] !== 0x73 || magic[3] !== 0x6d) {
-    var hex = Array.from(magic)
-      .map(function (b) { return b.toString(16).padStart(2, '0'); })
-      .join(' ');
+    sfWorker = new Worker(SF_JS);
+  } catch (err) {
     throw new Error(
-      'Invalid WASM binary — magic bytes wrong.\n' +
-      'URL:      ' + SF_WASM + '\n' +
-      'Expected: 00 61 73 6d  (\\0asm)\n' +
-      'Got:      ' + hex +
-      (magic[0] === 0x3c
-        ? '\n(0x3c = "<" — the CDN returned an HTML error page, not a WASM file)'
-        : '')
+      'new Worker(' + SF_JS + ') threw synchronously.\n' + fmt(err)
     );
   }
 
-  var mb = (wasmBinary.byteLength / 1048576).toFixed(1);
-  emit('status', { message: 'WASM valid · ' + mb + ' MB\nFetching engine JS…' });
+  // ── 3. Wire Stockfish worker handlers ─────────────────────────────────────
 
-  // ── Step 3: Fetch JS as text, load via blob URL ───────────────────────────
-  //
-  // WHY BLOB URL:
-  //   importScripts with a cross-origin CDN URL is subject to the browser's
-  //   cross-origin error masking.  Any error inside the script — SyntaxError,
-  //   RuntimeError, missing feature, etc. — arrives as the opaque "Script error."
-  //   with no details.
-  //
-  //   Blob URLs are always same-origin.  By fetching the JS text ourselves
-  //   (which only requires CORP from the CDN, which jsDelivr provides) and
-  //   wrapping it in a Blob, we get full error details if the script throws.
-  //
-  stage = 'js-fetch';
+  // Timeout: if uciok does not arrive within 30 s the WASM silently failed.
+  initTimer = setTimeout(function () {
+    emit('error', {
+      message:
+        'Stockfish worker timed out waiting for uciok (30 s).\n' +
+        'Stage at timeout: ' + stage + '\n' +
+        'The WASM binary likely failed to load. Verify these URLs exist:\n' +
+        '  JS:   ' + SF_JS + '\n' +
+        '  WASM: ' + SF_WASM,
+    });
+    if (sfWorker) { sfWorker.terminate(); sfWorker = null; }
+  }, 30000);
 
-  var jsText;
-  try {
-    var jr = await fetch(SF_JS);
-    if (!jr.ok) {
-      throw new Error(
-        'HTTP ' + jr.status + ' ' + jr.statusText + '\nURL: ' + SF_JS
-      );
+  sfWorker.onmessage = function (event) {
+    // event.data is a plain UCI string line produced by the Stockfish worker
+    var line = typeof event.data === 'string'
+      ? event.data.trim()
+      : (event.data !== null && event.data !== undefined
+          ? String(event.data).trim()
+          : '');
+    if (!line) return;
+
+    emit('output', { line: line });
+
+    if (line === 'uciok') {
+      clearTimeout(initTimer);
+      emit('uciok');
     }
-    var jct = jr.headers.get('content-type') || '';
-    if (/text\/html/i.test(jct)) {
-      throw new Error(
-        'Server returned HTML instead of JavaScript.\n' +
-        'URL: ' + SF_JS + '\nContent-Type: ' + jct
-      );
+    if (line === 'readyok') {
+      emit('readyok');
     }
-    stage = 'js-read';
-    jsText = await jr.text();
-  } catch (fetchErr) {
-    throw new Error('JS fetch failed\n' + formatErr(fetchErr));
-  }
-
-  // Create the blob URL and clean it up whether importScripts succeeds or not.
-  stage = 'blob-create';
-  var blobUrl = URL.createObjectURL(
-    new Blob([jsText], { type: 'text/javascript' })
-  );
-
-  // ── Step 4: Set Module BEFORE importScripts ───────────────────────────────
-  // Some Emscripten builds read the global Module at parse time.
-  // Providing wasmBinary here (and again to the factory in step 6) means
-  // the engine never needs to fetch the WASM by URL — it uses our buffer.
-  stage = 'module-setup';
-  var printEnabled = true;
-  self.Module = {
-    wasmBinary:  wasmBinary,
-    locateFile:  function (name) { return SF_BASE + name; },
-    print:       function (line) { if (printEnabled) processLine(line); },
-    printErr:    function () {},
   };
 
-  // ── Step 5: importScripts via blob URL ────────────────────────────────────
-  // Now same-origin → real error messages on failure.
-  stage = 'js-import';
-  try {
-    importScripts(blobUrl);
-  } catch (importErr) {
-    URL.revokeObjectURL(blobUrl);
-    throw new Error(
-      'importScripts failed for ' + SF_JS + '\n' + formatErr(importErr)
-    );
-  }
-  URL.revokeObjectURL(blobUrl);
+  sfWorker.onerror = function (errorEvent) {
+    clearTimeout(initTimer);
 
-  // ── Step 6: Locate the factory ────────────────────────────────────────────
-  // The build may set self.Stockfish, self.STOCKFISH, or overwrite self.Module
-  // with a function (some Emscripten builds replace the Module object with
-  // the factory function itself).
-  stage = 'factory-locate';
+    // Cross-origin worker errors may be masked by the browser.
+    // Show what we have; include the URL so the user can diagnose.
+    var msg =
+      (errorEvent.message &&
+       errorEvent.message !== 'Script error.' &&
+       errorEvent.message !== 'undefined'
+        ? errorEvent.message
+        : null) ||
+      (errorEvent.error ? fmt(errorEvent.error) : null) ||
+      'Error details not available (cross-origin worker masking).\n' +
+      'Most likely cause: WASM failed to load or is incompatible.\n' +
+      '  Verify the WASM exists and is a valid binary at:\n' +
+      '  ' + SF_WASM;
 
-  var origModuleIsFunc = typeof self.Module === 'function';
-  var factory =
-    (typeof self.Stockfish  === 'function' ? self.Stockfish  : null) ||
-    (typeof self.STOCKFISH  === 'function' ? self.STOCKFISH  : null) ||
-    (origModuleIsFunc                      ? self.Module     : null) ||
-    null;
+    if (errorEvent.filename && errorEvent.filename !== SF_JS) {
+      msg += '\nError source: ' + errorEvent.filename + ':' + (errorEvent.lineno || '?');
+    }
 
-  if (!factory) {
-    // Report all keys that appeared on self after importScripts
-    var selfKeys = Object.keys(self)
-      .filter(function (k) {
-        return !['Module','onerror','onunhandledrejection','onmessage'].includes(k);
-      });
-    throw new Error(
-      'No Stockfish factory found on self after importScripts.\n' +
-      'URL: ' + SF_JS + '\n' +
-      'self keys after import: ' + (selfKeys.length ? selfKeys.join(', ') : '(none added)') + '\n' +
-      'typeof self.Stockfish: ' + typeof self.Stockfish + '\n' +
-      'typeof self.STOCKFISH: ' + typeof self.STOCKFISH + '\n' +
-      'typeof self.Module:    ' + typeof self.Module + '\n\n' +
-      'Possible cause: the .js file uses ES module syntax (export/import)\n' +
-      'and cannot be loaded by importScripts in a classic worker.\n' +
-      'If this is the case, the engine.worker.js must be converted to a\n' +
-      'module worker (new Worker(url, {type:"module"})) and use dynamic import().'
-    );
-  }
-
-  // ── Step 7: Call factory ──────────────────────────────────────────────────
-  stage = 'factory-call';
-  var factoryResult;
-  try {
-    factoryResult = factory({
-      wasmBinary:  wasmBinary,
-      locateFile:  function (name) { return SF_BASE + name; },
-      print:       function (line) { if (printEnabled) processLine(line); },
-      printErr:    function () {},
+    emit('error', {
+      message: 'Stockfish worker error at stage=' + stage + '\n' + msg,
     });
-  } catch (callErr) {
-    throw new Error('Factory call threw synchronously\n' + formatErr(callErr));
-  }
+  };
 
-  // ── Step 8: Await WASM instantiation ──────────────────────────────────────
-  // SF16 NNUE: Stockfish() returns a Promise that resolves once the WASM
-  // module is compiled and the engine has started.
-  stage = 'wasm-instantiate';
-  var sf;
-  try {
-    sf = (factoryResult && typeof factoryResult.then === 'function')
-      ? await factoryResult
-      : factoryResult;
-  } catch (instErr) {
-    throw new Error('WASM instantiation failed\n' + formatErr(instErr));
-  }
+  sfWorker.onmessageerror = function () {
+    clearTimeout(initTimer);
+    emit('error', {
+      message: 'Stockfish worker message error at stage=' + stage +
+               '\n(message payload could not be deserialized)',
+    });
+  };
 
-  if (!sf || typeof sf.postMessage !== 'function') {
-    throw new Error(
-      'Factory resolved but engine object has no postMessage method.\n' +
-      'URL: ' + SF_JS + '\n' +
-      'Received type: ' + typeof sf + '  value: ' + String(sf)
-    );
-  }
-
-  // ── Step 9: Wire UCI output listener ──────────────────────────────────────
-  // addMessageListener is the standard nmrugg SF16 UCI output API.
-  // If present, disable Module.print to avoid duplicate output lines.
-  stage = 'wire-listener';
-  if (typeof sf.addMessageListener === 'function') {
-    printEnabled = false;
-    sf.addMessageListener(processLine);
-  } else if ('onmessage' in sf) {
-    printEnabled = false;
-    sf.onmessage = function (e) {
-      processLine(typeof e === 'string' ? e : (e && e.data !== undefined ? e.data : ''));
-    };
-  }
-  // If neither API is present, Module.print (wired in step 4) handles output.
-
-  stage = 'ready';
-  engine = sf;
-
+  // ── 4. Start UCI handshake ────────────────────────────────────────────────
+  // The Stockfish worker handles 'uci' by outputting engine id lines then
+  // 'uciok'.  We catch 'uciok' in onmessage above.
+  stage = 'uci-handshake';
   emit('loaded', {
     version:     'Stockfish 16 NNUE · single-thread',
     multiThread: false,
   });
+  emit('status', { message: 'Stockfish worker started · waiting for uciok…' });
+  sfWorker.postMessage('uci');
+}
 
-  // Start UCI handshake — engine will respond with id lines then 'uciok'.
-  sf.postMessage('uci');
+// ── URL CHECKER ───────────────────────────────────────────────────────────────
+
+async function verifyUrl(url, label) {
+  var resp;
+  try {
+    // HEAD is enough to confirm the file exists; avoids downloading the binary.
+    // 405 means HEAD is not supported by the server — file still exists.
+    resp = await fetch(url, { method: 'HEAD' });
+  } catch (netErr) {
+    throw new Error(
+      label + ' network error — CDN unreachable.\n' +
+      'URL: ' + url + '\n' + fmt(netErr)
+    );
+  }
+  if (!resp.ok && resp.status !== 405) {
+    throw new Error(
+      label + ' returned HTTP ' + resp.status + ' ' + resp.statusText + '\n' +
+      'URL: ' + url + '\n' +
+      (resp.status === 404
+        ? 'File not found on CDN. Verify the filename is correct.'
+        : 'Unexpected response from CDN.')
+    );
+  }
 }
